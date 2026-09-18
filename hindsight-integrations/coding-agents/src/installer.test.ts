@@ -724,6 +724,19 @@ describe("dsh installer", () => {
     expect(readFileSync(patchPath(ctx), "utf8").trim()).toBe("[]");
   });
 
+  it("re-install after uninstall does not glue our block onto the leftover '[]'", () => {
+    const ctx = makeCtx();
+    run(["install", "dsh"], ctx);
+    run(["uninstall", "dsh"], ctx);
+    expect(readFileSync(patchPath(ctx), "utf8").trim()).toBe("[]");
+    run(["install", "dsh"], ctx);
+    const patch = readFileSync(patchPath(ctx), "utf8");
+    // "[]" is a scalar: a sequence entry after it is invalid YAML, and dsh fails BOOT on this
+    // file. The leftover must be treated as an empty patch layer, not as content to keep.
+    expect(patch.trim().startsWith("[]")).toBe(false);
+    expect(patch.match(/- id: hindsight/g)).toHaveLength(1);
+  });
+
   it("uninstall keeps the user's own patches", () => {
     const ctx = makeCtx();
     run(["install", "dsh"], ctx);

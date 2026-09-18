@@ -1619,7 +1619,11 @@ const dsh: HarnessInstaller = {
     const existing = existsSync(path) ? readFileSync(path, "utf8") : "";
     // REPLACE any previous block rather than skipping: a re-install after the package moved must
     // repair the now-dead path, which is exactly what `install` is for.
-    const others = existing.replace(DSH_BLOCK_RE, "\n").trim();
+    const stripped = existing.replace(DSH_BLOCK_RE, "\n").trim();
+    // A previous UNINSTALL leaves "[]" behind (dsh requires a top-level array, see uninstall).
+    // That is an empty patch layer, not content: concatenating our block after it yields a scalar
+    // followed by sequence entries — invalid YAML that crash-loops the host on boot.
+    const others = stripped === "[]" ? "" : stripped;
     const entry = pathToFileURL(join(c.dist, "dsh.js")).href;
     const block =
       `${DSH_MARKER_START}\n` +
