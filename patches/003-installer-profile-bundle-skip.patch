@@ -1,0 +1,177 @@
+From dc4d6773a2c6353dfe49d8fb716a548b898f6fbd Mon Sep 17 00:00:00 2001
+From: codesyslab <codesyslab@users.noreply.github.com>
+Date: Fri, 18 Sep 2026 08:52:59 +0300
+Subject: [PATCH] =?UTF-8?q?patch:=20installer-profile-bundle-skip=20?=
+ =?UTF-8?q?=E2=80=94=20defer=20to=20profile=20bundle=20registration?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+install() dsh-инсталлера сканирует $DSH_HOME/profiles/*/package.json: если пакет
+уже в dsh.profile.bundles, глобальный insert в cordis.patch.yml не пишется
+(bundle владеет loader id hindsight; дубль = duplicate loader entry id → BOOT
+crash-loop). Stale-блок от старого install снимается, слой сходится к [] или
+к своим патчам юзера. Поведение без bundle — без изменений.
+
+Прод-инцидент 18.09.2026 (второй подряд после 002): skillsync после rework'а
+плагинов перезапустил install, тот вписал /tmp-путь + блок → dsh-web down.
+---
+ .../coding-agents/src/installer.test.ts       | 57 +++++++++++++++++++
+ .../coding-agents/src/installer.ts            | 52 ++++++++++++++++-
+ 2 files changed, 108 insertions(+), 1 deletion(-)
+
+diff --git a/hindsight-integrations/coding-agents/src/installer.test.ts b/hindsight-integrations/coding-agents/src/installer.test.ts
+index 8f238a839..81a7af2a6 100644
+--- a/hindsight-integrations/coding-agents/src/installer.test.ts
++++ b/hindsight-integrations/coding-agents/src/installer.test.ts
+@@ -737,6 +737,63 @@ describe("dsh installer", () => {
+     expect(patch.match(/- id: hindsight/g)).toHaveLength(1);
+   });
+ 
++  it("defers to a profile bundle that already registers the plugin", () => {
++    const ctx = makeCtx();
++    const profileDir = join(ctx.home, ".dsh", "profiles", "web");
++    mkdirSync(profileDir, { recursive: true });
++    writeJsonAt(join(profileDir, "package.json"), {
++      dsh: {
++        profile: {
++          bundles: ["@deepseek-ai/dsh-web-app", "@vectorize-io/hindsight-coding-agents"],
++        },
++      },
++    });
++    expect(run(["install", "dsh"], ctx)).toBe(0);
++    // The bundle owns loader id "hindsight"; a home-level insert would duplicate it and the
++    // host fails BOOT with "duplicate loader entry id". The home layer stays an empty list.
++    const patch = readFileSync(patchPath(ctx), "utf8");
++    expect(patch).not.toContain("id: hindsight");
++    expect(patch.trim()).toBe("[]");
++  });
++
++  it("repairs a stale home block once a profile bundle owns registration", () => {
++    const ctx = makeCtx();
++    mkdirSync(dirname(patchPath(ctx)), { recursive: true });
++    // What a pre-bundle install left behind: the user's own patch plus our marker block.
++    writeFileSync(
++      patchPath(ctx),
++      "- id: llm\n  config:\n    provider: deepseek\n" +
++        "# HINDSIGHT_CODING_AGENTS_DSH_START\n" +
++        "- insert:\n" +
++        "    - id: hindsight\n" +
++        '      name: "file:///old/dist/dsh.js"\n' +
++        "# HINDSIGHT_CODING_AGENTS_DSH_END\n"
++    );
++    const profileDir = join(ctx.home, ".dsh", "profiles", "web");
++    mkdirSync(profileDir, { recursive: true });
++    writeJsonAt(join(profileDir, "package.json"), {
++      dsh: { profile: { bundles: ["@vectorize-io/hindsight-coding-agents"] } },
++    });
++    run(["install", "dsh"], ctx);
++    const patch = readFileSync(patchPath(ctx), "utf8");
++    // The stale hindsight row is stripped (the bundle provides it); the user's patch stays.
++    expect(patch).not.toContain("id: hindsight");
++    expect(patch).toContain("provider: deepseek");
++  });
++
++  it("still writes the home block when no profile bundles the plugin", () => {
++    const ctx = makeCtx();
++    // A profiles dir exists, but no manifest lists our package — the home layer is the only
++    // registration route and must keep working exactly as before.
++    const profileDir = join(ctx.home, ".dsh", "profiles", "web");
++    mkdirSync(profileDir, { recursive: true });
++    writeJsonAt(join(profileDir, "package.json"), {
++      dsh: { profile: { bundles: ["@deepseek-ai/dsh-web-app"] } },
++    });
++    expect(run(["install", "dsh"], ctx)).toBe(0);
++    expect(readFileSync(patchPath(ctx), "utf8")).toContain("- id: hindsight");
++  });
++
+   it("uninstall keeps the user's own patches", () => {
+     const ctx = makeCtx();
+     run(["install", "dsh"], ctx);
+diff --git a/hindsight-integrations/coding-agents/src/installer.ts b/hindsight-integrations/coding-agents/src/installer.ts
+index 2477d1d71..743d2b8b4 100644
+--- a/hindsight-integrations/coding-agents/src/installer.ts
++++ b/hindsight-integrations/coding-agents/src/installer.ts
+@@ -29,6 +29,7 @@ import {
+   existsSync,
+   mkdirSync,
+   mkdtempSync,
++  readdirSync,
+   readFileSync,
+   readSync,
+   realpathSync,
+@@ -1597,6 +1598,39 @@ function dshHome(c: InstallCtx): string {
+   return process.env.DSH_HOME || join(c.home, ".dsh");
+ }
+ 
++/**
++ * A dsh profile whose `dsh.profile.bundles` already lists this package registers the plugin
++ * itself — under the same loader id (`hindsight`) the home-level insert would use. Detect that
++ * so install() can defer to the bundle: writing both makes the host fail BOOT with
++ * "duplicate loader entry id: hindsight". Returns the profile name, or undefined when no
++ * profile bundles the package (then the home-layer insert is the only registration).
++ */
++function dshProfileBundle(c: InstallCtx): string | undefined {
++  const profilesDir = join(dshHome(c), "profiles");
++  let names: string[];
++  try {
++    names = readdirSync(profilesDir);
++  } catch {
++    return undefined; // no profiles dir — nothing to defer to
++  }
++  for (const name of names) {
++    const manifest = join(profilesDir, name, "package.json");
++    if (!existsSync(manifest)) continue;
++    try {
++      const parsed = JSON.parse(readFileSync(manifest, "utf8")) as {
++        dsh?: { profile?: { bundles?: unknown } };
++      };
++      const bundles = parsed.dsh?.profile?.bundles;
++      if (Array.isArray(bundles) && bundles.includes("@vectorize-io/hindsight-coding-agents")) {
++        return name;
++      }
++    } catch {
++      // Unreadable / non-JSON manifest — not evidence of a bundle; keep looking.
++    }
++  }
++  return undefined;
++}
++
+ /**
+  * DeepSeek Harness — a native Cordis plugin, wired through the HOME-level patch layer
+  * (`$DSH_HOME/cordis.patch.yml`), which every profile composes after its bundles.
+@@ -1605,7 +1639,9 @@ function dshHome(c: InstallCtx): string {
+  * pnpm-installs the package into ONE profile and picks up the `dsh.bundle.patch` this package
+  * ships. That is the right route for a published install and is what the docs recommend, but it
+  * needs pnpm, a network, and a repeat per profile — so the installer takes the path that always
+- * works: patch the home layer to load the dist entry that is already on this machine.
++ * works: patch the home layer to load the dist entry that is already on this machine. When a
++ * profile ALREADY bundles the package, install() defers to that registration instead (see
++ * dshProfileBundle) — a second insert would fail the host's duplicate-loader-id check on boot.
+  *
+  * The row's `name` MUST be a `file://` URL. Cordis resolves it as an ES module specifier, and a
+  * bare absolute path is not one — the same trap Kilo has, where it fails to resolve and the plugin
+@@ -1624,6 +1660,20 @@ const dsh: HarnessInstaller = {
+     // That is an empty patch layer, not content: concatenating our block after it yields a scalar
+     // followed by sequence entries — invalid YAML that crash-loops the host on boot.
+     const others = stripped === "[]" ? "" : stripped;
++    const bundled = dshProfileBundle(c);
++    if (bundled) {
++      // The profile's bundle owns registration under loader id "hindsight"; the home insert
++      // would duplicate it and the host fails BOOT. Converge the home layer to just the
++      // user's own patches (possibly none → "[]"), removing any stale block a pre-bundle
++      // install left behind. install() must stay idempotent here: every re-run keeps this
++      // state instead of re-adding the block.
++      mkdirSync(dirname(path), { recursive: true });
++      if (!existsSync(path) || others !== existing.trim())
++        writeFileSync(path, others ? `${others}\n` : "[]\n");
++      installSkill(c, "dsh");
++      c.log?.(`dsh: profile "${bundled}" already bundles the plugin — home patch layer kept clear`);
++      return;
++    }
+     const entry = pathToFileURL(join(c.dist, "dsh.js")).href;
+     const block =
+       `${DSH_MARKER_START}\n` +
+-- 
+2.53.0
+
