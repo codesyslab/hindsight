@@ -737,6 +737,63 @@ describe("dsh installer", () => {
     expect(patch.match(/- id: hindsight/g)).toHaveLength(1);
   });
 
+  it("defers to a profile bundle that already registers the plugin", () => {
+    const ctx = makeCtx();
+    const profileDir = join(ctx.home, ".dsh", "profiles", "web");
+    mkdirSync(profileDir, { recursive: true });
+    writeJsonAt(join(profileDir, "package.json"), {
+      dsh: {
+        profile: {
+          bundles: ["@deepseek-ai/dsh-web-app", "@vectorize-io/hindsight-coding-agents"],
+        },
+      },
+    });
+    expect(run(["install", "dsh"], ctx)).toBe(0);
+    // The bundle owns loader id "hindsight"; a home-level insert would duplicate it and the
+    // host fails BOOT with "duplicate loader entry id". The home layer stays an empty list.
+    const patch = readFileSync(patchPath(ctx), "utf8");
+    expect(patch).not.toContain("id: hindsight");
+    expect(patch.trim()).toBe("[]");
+  });
+
+  it("repairs a stale home block once a profile bundle owns registration", () => {
+    const ctx = makeCtx();
+    mkdirSync(dirname(patchPath(ctx)), { recursive: true });
+    // What a pre-bundle install left behind: the user's own patch plus our marker block.
+    writeFileSync(
+      patchPath(ctx),
+      "- id: llm\n  config:\n    provider: deepseek\n" +
+        "# HINDSIGHT_CODING_AGENTS_DSH_START\n" +
+        "- insert:\n" +
+        "    - id: hindsight\n" +
+        '      name: "file:///old/dist/dsh.js"\n' +
+        "# HINDSIGHT_CODING_AGENTS_DSH_END\n"
+    );
+    const profileDir = join(ctx.home, ".dsh", "profiles", "web");
+    mkdirSync(profileDir, { recursive: true });
+    writeJsonAt(join(profileDir, "package.json"), {
+      dsh: { profile: { bundles: ["@vectorize-io/hindsight-coding-agents"] } },
+    });
+    run(["install", "dsh"], ctx);
+    const patch = readFileSync(patchPath(ctx), "utf8");
+    // The stale hindsight row is stripped (the bundle provides it); the user's patch stays.
+    expect(patch).not.toContain("id: hindsight");
+    expect(patch).toContain("provider: deepseek");
+  });
+
+  it("still writes the home block when no profile bundles the plugin", () => {
+    const ctx = makeCtx();
+    // A profiles dir exists, but no manifest lists our package — the home layer is the only
+    // registration route and must keep working exactly as before.
+    const profileDir = join(ctx.home, ".dsh", "profiles", "web");
+    mkdirSync(profileDir, { recursive: true });
+    writeJsonAt(join(profileDir, "package.json"), {
+      dsh: { profile: { bundles: ["@deepseek-ai/dsh-web-app"] } },
+    });
+    expect(run(["install", "dsh"], ctx)).toBe(0);
+    expect(readFileSync(patchPath(ctx), "utf8")).toContain("- id: hindsight");
+  });
+
   it("uninstall keeps the user's own patches", () => {
     const ctx = makeCtx();
     run(["install", "dsh"], ctx);

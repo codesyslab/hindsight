@@ -29,6 +29,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   readSync,
   realpathSync,
@@ -1598,6 +1599,39 @@ function dshHome(c: InstallCtx): string {
 }
 
 /**
+ * A dsh profile whose `dsh.profile.bundles` already lists this package registers the plugin
+ * itself — under the same loader id (`hindsight`) the home-level insert would use. Detect that
+ * so install() can defer to the bundle: writing both makes the host fail BOOT with
+ * "duplicate loader entry id: hindsight". Returns the profile name, or undefined when no
+ * profile bundles the package (then the home-layer insert is the only registration).
+ */
+function dshProfileBundle(c: InstallCtx): string | undefined {
+  const profilesDir = join(dshHome(c), "profiles");
+  let names: string[];
+  try {
+    names = readdirSync(profilesDir);
+  } catch {
+    return undefined; // no profiles dir — nothing to defer to
+  }
+  for (const name of names) {
+    const manifest = join(profilesDir, name, "package.json");
+    if (!existsSync(manifest)) continue;
+    try {
+      const parsed = JSON.parse(readFileSync(manifest, "utf8")) as {
+        dsh?: { profile?: { bundles?: unknown } };
+      };
+      const bundles = parsed.dsh?.profile?.bundles;
+      if (Array.isArray(bundles) && bundles.includes("@vectorize-io/hindsight-coding-agents")) {
+        return name;
+      }
+    } catch {
+      // Unreadable / non-JSON manifest — not evidence of a bundle; keep looking.
+    }
+  }
+  return undefined;
+}
+
+/**
  * DeepSeek Harness — a native Cordis plugin, wired through the HOME-level patch layer
  * (`$DSH_HOME/cordis.patch.yml`), which every profile composes after its bundles.
  *
@@ -1605,7 +1639,9 @@ function dshHome(c: InstallCtx): string {
  * pnpm-installs the package into ONE profile and picks up the `dsh.bundle.patch` this package
  * ships. That is the right route for a published install and is what the docs recommend, but it
  * needs pnpm, a network, and a repeat per profile — so the installer takes the path that always
- * works: patch the home layer to load the dist entry that is already on this machine.
+ * works: patch the home layer to load the dist entry that is already on this machine. When a
+ * profile ALREADY bundles the package, install() defers to that registration instead (see
+ * dshProfileBundle) — a second insert would fail the host's duplicate-loader-id check on boot.
  *
  * The row's `name` MUST be a `file://` URL. Cordis resolves it as an ES module specifier, and a
  * bare absolute path is not one — the same trap Kilo has, where it fails to resolve and the plugin
@@ -1624,6 +1660,20 @@ const dsh: HarnessInstaller = {
     // That is an empty patch layer, not content: concatenating our block after it yields a scalar
     // followed by sequence entries — invalid YAML that crash-loops the host on boot.
     const others = stripped === "[]" ? "" : stripped;
+    const bundled = dshProfileBundle(c);
+    if (bundled) {
+      // The profile's bundle owns registration under loader id "hindsight"; the home insert
+      // would duplicate it and the host fails BOOT. Converge the home layer to just the
+      // user's own patches (possibly none → "[]"), removing any stale block a pre-bundle
+      // install left behind. install() must stay idempotent here: every re-run keeps this
+      // state instead of re-adding the block.
+      mkdirSync(dirname(path), { recursive: true });
+      if (!existsSync(path) || others !== existing.trim())
+        writeFileSync(path, others ? `${others}\n` : "[]\n");
+      installSkill(c, "dsh");
+      c.log?.(`dsh: profile "${bundled}" already bundles the plugin — home patch layer kept clear`);
+      return;
+    }
     const entry = pathToFileURL(join(c.dist, "dsh.js")).href;
     const block =
       `${DSH_MARKER_START}\n` +
