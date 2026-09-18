@@ -1,0 +1,69 @@
+From cb20bf6e22633615bdfa1eff173ae879525291ba Mon Sep 17 00:00:00 2001
+From: codesyslab <codesyslab@users.noreply.github.com>
+Date: Fri, 18 Sep 2026 08:36:26 +0300
+Subject: [PATCH] =?UTF-8?q?patch:=20installer-reinstall-empty-list=20?=
+ =?UTF-8?q?=E2=80=94=20treat=20leftover=20'[]'=20as=20empty=20patch=20laye?=
+ =?UTF-8?q?r?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+uninstall() leaves '[]' in $DSH_HOME/cordis.patch.yml (dsh requires a
+top-level array); install() then treated that scalar as user content and
+concatenated its marker block after it — a scalar followed by sequence
+entries is invalid YAML and crash-loops dsh-web on boot.
+
+Observed in production 18.09.2026: skillsync reinstall produced
+'[]\n\n# HINDSIGHT_CODING_AGENTS_DSH_START...' pointing at a dead
+file:///tmp path; dsh-web crash-looped until the file was repaired by hand.
+
+Regression test: install → uninstall → install round trip.
+---
+ .../coding-agents/src/installer.test.ts             | 13 +++++++++++++
+ .../coding-agents/src/installer.ts                  |  6 +++++-
+ 2 files changed, 18 insertions(+), 1 deletion(-)
+
+diff --git a/hindsight-integrations/coding-agents/src/installer.test.ts b/hindsight-integrations/coding-agents/src/installer.test.ts
+index 80d85afeb..8f238a839 100644
+--- a/hindsight-integrations/coding-agents/src/installer.test.ts
++++ b/hindsight-integrations/coding-agents/src/installer.test.ts
+@@ -724,6 +724,19 @@ describe("dsh installer", () => {
+     expect(readFileSync(patchPath(ctx), "utf8").trim()).toBe("[]");
+   });
+ 
++  it("re-install after uninstall does not glue our block onto the leftover '[]'", () => {
++    const ctx = makeCtx();
++    run(["install", "dsh"], ctx);
++    run(["uninstall", "dsh"], ctx);
++    expect(readFileSync(patchPath(ctx), "utf8").trim()).toBe("[]");
++    run(["install", "dsh"], ctx);
++    const patch = readFileSync(patchPath(ctx), "utf8");
++    // "[]" is a scalar: a sequence entry after it is invalid YAML, and dsh fails BOOT on this
++    // file. The leftover must be treated as an empty patch layer, not as content to keep.
++    expect(patch.trim().startsWith("[]")).toBe(false);
++    expect(patch.match(/- id: hindsight/g)).toHaveLength(1);
++  });
++
+   it("uninstall keeps the user's own patches", () => {
+     const ctx = makeCtx();
+     run(["install", "dsh"], ctx);
+diff --git a/hindsight-integrations/coding-agents/src/installer.ts b/hindsight-integrations/coding-agents/src/installer.ts
+index 2e78e6cda..2477d1d71 100644
+--- a/hindsight-integrations/coding-agents/src/installer.ts
++++ b/hindsight-integrations/coding-agents/src/installer.ts
+@@ -1619,7 +1619,11 @@ const dsh: HarnessInstaller = {
+     const existing = existsSync(path) ? readFileSync(path, "utf8") : "";
+     // REPLACE any previous block rather than skipping: a re-install after the package moved must
+     // repair the now-dead path, which is exactly what `install` is for.
+-    const others = existing.replace(DSH_BLOCK_RE, "\n").trim();
++    const stripped = existing.replace(DSH_BLOCK_RE, "\n").trim();
++    // A previous UNINSTALL leaves "[]" behind (dsh requires a top-level array, see uninstall).
++    // That is an empty patch layer, not content: concatenating our block after it yields a scalar
++    // followed by sequence entries — invalid YAML that crash-loops the host on boot.
++    const others = stripped === "[]" ? "" : stripped;
+     const entry = pathToFileURL(join(c.dist, "dsh.js")).href;
+     const block =
+       `${DSH_MARKER_START}\n` +
+-- 
+2.53.0
+
