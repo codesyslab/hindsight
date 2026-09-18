@@ -213,6 +213,27 @@ const RETRY_AFTER_FLOOR_MS = 10 * 1000;
  */
 const RETRY_AFTER_CEILING_MS = 60 * 1000;
 
+/**
+ * Distinguish "this server has no knowledge-base API" from "this BANK does not exist yet".
+ *
+ * Both answer 404, but only the first means the capability is missing. Hindsight creates a bank
+ * LAZILY, so on the first session of a repo every bank-scoped route answers
+ * `{"detail":"Bank '<id>' not found"}` until the background seed creates it. Treating that as a
+ * missing capability latched `knowledgePagesSupported = false` for the rest of the process and made
+ * every later page call fail with `knowledge_pages_unavailable` — a false capability report, on a
+ * server that supports knowledge pages perfectly well.
+ *
+ * The original body is left unread (clone), so the caller can still consume it.
+ */
+async function bankMissingIn(r: Response): Promise<boolean> {
+  try {
+    const body = (await r.clone().json()) as { detail?: unknown };
+    return typeof body?.detail === "string" && /bank\b[\s\S]*\bnot found/i.test(body.detail);
+  } catch {
+    return false;
+  }
+}
+
 export class HindsightClient {
   readonly apiUrl: string;
   /** The credential the NEXT request will sign with — NOT the one the config file holds. The two
@@ -604,8 +625,13 @@ export class HindsightClient {
    */
   async tree(): Promise<KnowledgeNode[]> {
     if (this.knowledgePagesSupported === false) throw new KnowledgePagesUnavailableError();
-    const r = await this.req("GET", this.bankUrl("/knowledge-base/tree"));
-    if ([404, 405, 501].includes(r.status)) {
+    const r = await this.req("GET", this.bankUrl("/knowledge-base/tree"), undefined, [405, 501]);
+    if (r.status === 404) {
+      if (await bankMissingIn(r)) return [];
+      this.knowledgePagesSupported = false;
+      throw new KnowledgePagesUnavailableError();
+    }
+    if (r.status === 405 || r.status === 501) {
       this.knowledgePagesSupported = false;
       throw new KnowledgePagesUnavailableError();
     }
@@ -658,7 +684,13 @@ export class HindsightClient {
       "GET",
       this.bankUrl(`/knowledge-base/pages/${encodeURIComponent(pageId)}`)
     );
-    if (r.status === 404) throw new Error(`knowledge page not found: ${pageId}`);
+    if (r.status === 404) {
+      if (await bankMissingIn(r))
+        throw new Error(
+          `Hindsight bank "${this.bank}" does not exist yet - it is created on this repo's first ingest, so there are no knowledge pages to read yet`
+        );
+      throw new Error(`knowledge page not found: ${pageId}`);
+    }
     return await r.json();
   }
 
@@ -737,6 +769,12 @@ export class HindsightClient {
         // 409 = another deepen run seeded this name between our tree read and this POST. That is
         // the outcome we wanted anyway, so tolerate it rather than failing the whole run.
         const r = await this.req("POST", this.bankUrl("/knowledge-base/pages"), body, [409]);
+        if (r.status === 404 && (await bankMissingIn(r))) {
+          this.log(
+            `[bank] ${this.bank} does not exist yet; page seed deferred (the capability is present)`
+          );
+          return;
+        }
         if ([404, 405, 501].includes(r.status)) {
           this.knowledgePagesSupported = false;
           this.log(
@@ -773,6 +811,12 @@ export class HindsightClient {
           this.bankUrl(`/knowledge-base/nodes/${encodeURIComponent(hit.id)}`),
           patch
         );
+        if (r.status === 404 && (await bankMissingIn(r))) {
+          this.log(
+            `[bank] ${this.bank} does not exist yet; page re-sync deferred (the capability is present)`
+          );
+          return;
+        }
         if ([404, 405, 501].includes(r.status)) {
           this.knowledgePagesSupported = false;
           this.log(
